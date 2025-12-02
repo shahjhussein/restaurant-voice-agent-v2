@@ -1,6 +1,45 @@
 import express from "express";
 import dotenv from "dotenv";
 
+import WebSocket from "ws";
+
+function connectToOpenAI() {
+  const openAiWs = new WebSocket(
+    "wss://api.openai.com/v1/realtime?model=gpt-4o-realtime-preview",
+    {
+      headers: {
+        "Authorization": `Bearer ${process.env.OPENAI_API_KEY}`,
+        "OpenAI-Beta": "realtime=v1"
+      }
+    }
+  );
+
+  openAiWs.on("open", () => {
+    console.log("🧠 Connected to OpenAI Realtime");
+
+    // Initial session config
+    openAiWs.send(JSON.stringify({
+      type: "session.update",
+      session: {
+        instructions: "You are a friendly restaurant AI assistant.",
+        modalities: ["audio", "text"],
+        voice: "alloy"   // default OpenAI voice
+      }
+    }));
+  });
+
+  openAiWs.on("close", () => {
+    console.log("⭕ OpenAI WebSocket closed");
+  });
+
+  openAiWs.on("error", (err) => {
+    console.error("❌ OpenAI WebSocket error:", err);
+  });
+
+  return openAiWs;
+}
+
+
 dotenv.config();
 
 const app = express();
@@ -22,6 +61,27 @@ const wss = new WebSocketServer({ server });
 wss.on("connection", (ws) => {
   console.log("🔌 Twilio media stream connected");
 
+  // Connect to OpenAI for this call
+  const openAiWs = connectToOpenAI();
+
+  openAiWs.on("message", (raw) => {
+  const msg = JSON.parse(raw.toString());
+
+  // OpenAI will send audio chunks in streaming events
+  if (msg.type === "response.audio.delta") {
+    const audioChunk = msg.delta; // base64 PCM audio
+
+    // Send audio back to Twilio
+    ws.send(JSON.stringify({
+      event: "media",
+      media: {
+        payload: audioChunk
+      }
+    }));
+  }
+});
+
+
   ws.on("message", (msg) => {
     const data = JSON.parse(msg.toString());
 
@@ -30,8 +90,22 @@ wss.on("connection", (ws) => {
     }
 
     if (data.event === "media") {
-      // Base64-encoded mulaw audio from caller
-      console.log("🎤 Received audio chunk:", data.media.payload.length);
+      // Send caller audio to OpenAI
+      openAiWs.send(JSON.stringify({
+      type: "input_audio_buffer.append",
+      audio: data.media.payload  // base64 mulaw audio
+
+      // Tell OpenAI to process the audio chunk
+      openAiWs.send(JSON.stringify({
+      type: "input_audio_buffer.commit"
+      }));
+
+      openAiWs.send(JSON.stringify({
+      type: "response.create"
+      }));
+
+}));
+
     }
 
     if (data.event === "stop") {

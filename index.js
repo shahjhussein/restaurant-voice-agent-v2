@@ -57,27 +57,6 @@ function resampleLinear(input, fromRate, toRate) {
 }
 
 /* ----------------------------------------------------
- *  CONNECT TO OPENAI REALTIME (NO HANDLERS ATTACHED)
- * ---------------------------------------------------- */
-
-function createOpenAIWebSocket() {
-  const ws = new WebSocket(
-    "wss://api.openai.com/v1/realtime?model=gpt-4o-realtime-preview",
-    {
-      headers: {
-        Authorization: `Bearer ${process.env.OPENAI_API_KEY}`,
-        "OpenAI-Beta": "realtime=v1",
-      },
-    }
-  );
-
-  ws.on("error", (err) => console.error("❌ OpenAI error:", err));
-  ws.on("close", () => console.log("⭕ OpenAI WebSocket closed"));
-
-  return ws;
-}
-
-/* ----------------------------------------------------
  *  EXPRESS APP
  * ---------------------------------------------------- */
 
@@ -89,60 +68,83 @@ app.get("/", (_req, res) => {
 });
 
 /* ----------------------------------------------------
- *  HTTP + WSS SERVER
+ *  HTTP SERVER + MANUAL WS UPGRADE ON /media
  * ---------------------------------------------------- */
 
 const server = http.createServer(app);
-const wss = new WebSocketServer({ server });
+const wss = new WebSocketServer({ noServer: true });
+
+// Handle WebSocket upgrades explicitly (Render needs this)
+server.on("upgrade", (req, socket, head) => {
+  if (req.url === "/media") {
+    wss.handleUpgrade(req, socket, head, (ws) => {
+      wss.emit("connection", ws, req);
+    });
+  } else {
+    socket.destroy();
+  }
+});
 
 /* ----------------------------------------------------
  *  TWILIO MEDIA STREAM HANDLING
  * ---------------------------------------------------- */
 
-wss.on("connection", (ws) => {
-  console.log("🔌 Twilio Media Stream CONNECTED");
+wss.on("connection", (ws, req) => {
+  console.log("🔌 Twilio Media Stream CONNECTED on path:", req.url);
 
   // Per-call OpenAI WS + queue
-  const ai = createOpenAIWebSocket();
+  const ai = new WebSocket(
+    "wss://api.openai.com/v1/realtime?model=gpt-4o-realtime-preview",
+    {
+      headers: {
+        Authorization: `Bearer ${process.env.OPENAI_API_KEY}`,
+        "OpenAI-Beta": "realtime=v1",
+      },
+    }
+  );
+
   let aiReady = false;
   const aiQueue = [];
 
-  // When OpenAI is ready, set up session + flush queued audio
   ai.on("open", () => {
     console.log("🧠 OpenAI Realtime CONNECTED");
     aiReady = true;
 
     // Session config
-    const sessionUpdate = JSON.stringify({
-      type: "session.update",
-      session: {
-        instructions: `
-You are a friendly restaurant AI receptionist.
+    ai.send(
+      JSON.stringify({
+        type: "session.update",
+        session: {
+          instructions: `
+You are a friendly AI receptionist for a restaurant.
 Speak naturally in British English.
 Keep responses short and helpful.
 Ask for: name, date, time, and number of guests.
-You can do light small talk but stay focused on the booking.
-        `.trim(),
-        modalities: ["audio"],
-        voice: "alloy",
-      },
-    });
-
-    ai.send(sessionUpdate);
+Use light small talk but stay focused on taking the booking.
+          `.trim(),
+          modalities: ["audio"],
+          voice: "alloy",
+        },
+      })
+    );
 
     // Immediate greeting
-    const greeting = JSON.stringify({
-      type: "response.create",
-      response: { modalities: ["audio"] },
-    });
-    ai.send(greeting);
+    ai.send(
+      JSON.stringify({
+        type: "response.create",
+        response: { modalities: ["audio"] },
+      })
+    );
 
-    // Flush queued audio messages (if any arrived while connecting)
+    // Flush queued audio messages
     for (const msg of aiQueue) {
       ai.send(msg);
     }
     aiQueue.length = 0;
   });
+
+  ai.on("error", (err) => console.error("❌ OpenAI error:", err));
+  ai.on("close", () => console.log("⭕ OpenAI WebSocket closed"));
 
   /* ------------------------------------------------
    *  OPENAI → TWILIO  (AI SPEAKS)
@@ -156,7 +158,6 @@ You can do light small talk but stay focused on the booking.
       return;
     }
 
-    // Debug log
     // console.log("OpenAI event:", msg.type);
 
     if (
@@ -187,7 +188,7 @@ You can do light small talk but stay focused on the booking.
         mu[i] = linearToMuLawSample(pcm16[i]);
       }
 
-      // Pad small frames for safety
+      // Pad tiny frames (safety)
       if (mu.length < 160) {
         const padded = Buffer.alloc(160);
         mu.copy(padded);
@@ -246,7 +247,7 @@ You can do light small talk but stay focused on the booking.
       // 8k → 24k
       const pcm24 = resampleLinear(pcmFloat, 8000, 24000);
 
-      // Float32 → PCM16 Buffer for OpenAI
+      // Float32 → PCM16 Buffer (for OpenAI)
       const outBuf = Buffer.alloc(pcm24.length * 2);
       for (let i = 0; i < pcm24.length; i++) {
         const v = Math.max(-1, Math.min(1, pcm24[i]));
@@ -267,7 +268,6 @@ You can do light small talk but stay focused on the booking.
         response: { modalities: ["audio"] },
       });
 
-      // If OpenAI is ready, send immediately. Otherwise queue.
       if (aiReady && ai.readyState === WebSocket.OPEN) {
         ai.send(appendMsg);
         ai.send(commitMsg);
@@ -287,16 +287,16 @@ You can do light small talk but stay focused on the booking.
 });
 
 /* ----------------------------------------------------
- *  TWILIO VOICE WEBHOOK
+ *  TWILIO VOICE WEBHOOK  (/twilio/voice)
  * ---------------------------------------------------- */
 
 app.post("/twilio/voice", (_req, res) => {
   const twiml = new twilio.twiml.VoiceResponse();
   const connect = twiml.connect();
 
-  // IMPORTANT: WSS at ROOT (no /twilio-media-stream path)
+  // IMPORTANT: WebSocket URL MUST MATCH the upgrade path
   connect.stream({
-    url: "wss://restaurant-voice-agent-v2.onrender.com",
+    url: "wss://restaurant-voice-agent-v2.onrender.com/media",
   });
 
   res.type("text/xml");

@@ -150,4 +150,118 @@ wss.on("connection", (ws) => {
       }
 
       // 24k → 8k
-      const pcm8 = resampleLinear(pcmFloat,
+      const pcm8 = resampleLinear(pcmFloat, 24000, 8000);
+
+      // Float32 → PCM16
+      const pcm16 = new Int16Array(pcm8.length);
+      for (let i = 0; i < pcm8.length; i++) {
+        pcm16[i] = Math.max(-1, Math.min(1, pcm8[i])) * 32767;
+      }
+
+      // PCM16 → μ-law
+      let mu = Buffer.alloc(pcm16.length);
+      for (let i = 0; i < pcm16.length; i++) {
+        mu[i] = linearToMuLawSample(pcm16[i]);
+      }
+
+      // ❗ PAD to SAFE 160-byte chunk
+      if (mu.length < 160) {
+        const padded = Buffer.alloc(160);
+        mu.copy(padded);
+        mu = padded;
+      }
+
+      ws.send(JSON.stringify({
+        event: "media",
+        media: { payload: mu.toString("base64") }
+      }));
+    }
+  });
+
+  /* ------------------------------------------------
+   *  TWILIO → OPENAI  (CALLER SPEAKS)
+   * ------------------------------------------------ */
+  ws.on("message", (message) => {
+    let data;
+    try { data = JSON.parse(message.toString()); }
+    catch { return; }
+
+    if (data.event === "start") {
+      console.log("🟢 Stream START:", data.streamSid);
+    }
+
+    if (data.event === "media") {
+      const mulawBuf = Buffer.from(data.media.payload, "base64");
+
+      // μ-law → PCM16
+      const pcm16 = new Int16Array(mulawBuf.length);
+      for (let i = 0; i < mulawBuf.length; i++) {
+        pcm16[i] = muLawToLinear(mulawBuf[i]);
+      }
+
+      // PCM16 → Float32
+      const pcmFloat = new Float32Array(pcm16.length);
+      for (let i = 0; i < pcm16.length; i++) {
+        pcmFloat[i] = pcm16[i] / 32768;
+      }
+
+      // 8k → 24k
+      const pcm24 = resampleLinear(pcmFloat, 8000, 24000);
+
+      // Float32 → PCM16
+      const out = Buffer.alloc(pcm24.length * 2);
+      for (let i = 0; i < pcm24.length; i++) {
+        out.writeInt16LE(Math.max(-1, Math.min(1, pcm24[i])) * 32767, i * 2);
+      }
+
+      ai.send(JSON.stringify({
+        type: "input_audio_buffer.append",
+        audio: out.toString("base64")
+      }));
+
+      ai.send(JSON.stringify({ type: "input_audio_buffer.commit" }));
+
+      // ❗ Tell OpenAI to reply with audio
+      ai.send(JSON.stringify({
+        type: "response.create",
+        response: { modalities: ["audio"] }
+      }));
+    }
+
+    if (data.event === "stop") {
+      console.log("🔴 Stream STOP", data.streamSid);
+      ai.close();
+    }
+  });
+
+  ws.on("close", () => {
+    console.log("❌ Twilio WebSocket CLOSED");
+    try { ai.close(); } catch {}
+  });
+});
+
+/* ----------------------------------------------------
+ *  TWILIO VOICE WEBHOOK
+ * ---------------------------------------------------- */
+
+app.post("/twilio/voice", (_req, res) => {
+  const twiml = new twilio.twiml.VoiceResponse();
+  const connect = twiml.connect();
+
+  connect.stream({
+    // Must be ROOT path — your WSS listens at "/"
+    url: "wss://restaurant-voice-agent-v2.onrender.com"
+  });
+
+  res.type("text/xml");
+  res.send(twiml.toString());
+});
+
+/* ----------------------------------------------------
+ *  START SERVER
+ * ---------------------------------------------------- */
+
+const port = process.env.PORT || 3000;
+server.listen(port, () => {
+  console.log("Server listening on port", port);
+});

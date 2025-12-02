@@ -17,14 +17,17 @@ app.listen(port, () => {
 
 import twilio from "twilio";
 
-// ...
-
+// Twilio Voice Webhook
 app.post("/twilio/voice", (req, res) => {
   const twiml = new twilio.twiml.VoiceResponse();
-  twiml.say("Hello! Your Syntropy AI reservation system is connected successfully.");
-  twiml.hangup();
+
+  const connect = twiml.connect();
+  connect.stream({
+    url: "wss://restaurant-voice-agent-v2.onrender.com/twilio-media-stream"
+  });
 
   res.type("text/xml");
   res.send(twiml.toString());
 });
+
 

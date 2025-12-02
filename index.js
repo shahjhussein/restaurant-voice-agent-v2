@@ -27,9 +27,9 @@ function linearToMuLawSample(sample) {
 
 function muLawToLinear(mu) {
   mu = ~mu & 0xff;
-  let sign = mu & 0x80;
-  let exponent = (mu >> 4) & 0x07;
-  let mantissa = mu & 0x0f;
+  const sign = mu & 0x80;
+  const exponent = (mu >> 4) & 0x07;
+  const mantissa = mu & 0x0f;
   let sample = ((mantissa << 4) + 8) << (exponent + 3);
   return sign ? -sample : sample;
 }
@@ -57,46 +57,23 @@ function resampleLinear(input, fromRate, toRate) {
 }
 
 /* ----------------------------------------------------
- *  CONNECT TO OPENAI REALTIME
+ *  CONNECT TO OPENAI REALTIME (NO HANDLERS ATTACHED)
  * ---------------------------------------------------- */
 
-function connectToOpenAI() {
+function createOpenAIWebSocket() {
   const ws = new WebSocket(
     "wss://api.openai.com/v1/realtime?model=gpt-4o-realtime-preview",
     {
       headers: {
         Authorization: `Bearer ${process.env.OPENAI_API_KEY}`,
-        "OpenAI-Beta": "realtime=v1"
-      }
+        "OpenAI-Beta": "realtime=v1",
+      },
     }
   );
 
-  ws.on("open", () => {
-    console.log("🧠 Connected to OpenAI Realtime");
-
-    ws.send(JSON.stringify({
-      type: "session.update",
-      session: {
-        instructions: `
-You are a friendly restaurant AI receptionist.
-Speak naturally, British English.
-Keep responses short.
-Ask for name, date, time, and number of guests.
-        `.trim(),
-        modalities: ["audio"],
-        voice: "alloy"
-      }
-    }));
-
-    // ❗ FORCE IMMEDIATE GREETING
-    ws.send(JSON.stringify({
-      type: "response.create",
-      response: { modalities: ["audio"] }
-    }));
-  });
-
   ws.on("error", (err) => console.error("❌ OpenAI error:", err));
   ws.on("close", () => console.log("⭕ OpenAI WebSocket closed"));
+
   return ws;
 }
 
@@ -125,17 +102,62 @@ const wss = new WebSocketServer({ server });
 wss.on("connection", (ws) => {
   console.log("🔌 Twilio Media Stream CONNECTED");
 
-  const ai = connectToOpenAI();
+  // Per-call OpenAI WS + queue
+  const ai = createOpenAIWebSocket();
+  let aiReady = false;
+  const aiQueue = [];
+
+  // When OpenAI is ready, set up session + flush queued audio
+  ai.on("open", () => {
+    console.log("🧠 OpenAI Realtime CONNECTED");
+    aiReady = true;
+
+    // Session config
+    const sessionUpdate = JSON.stringify({
+      type: "session.update",
+      session: {
+        instructions: `
+You are a friendly restaurant AI receptionist.
+Speak naturally in British English.
+Keep responses short and helpful.
+Ask for: name, date, time, and number of guests.
+You can do light small talk but stay focused on the booking.
+        `.trim(),
+        modalities: ["audio"],
+        voice: "alloy",
+      },
+    });
+
+    ai.send(sessionUpdate);
+
+    // Immediate greeting
+    const greeting = JSON.stringify({
+      type: "response.create",
+      response: { modalities: ["audio"] },
+    });
+    ai.send(greeting);
+
+    // Flush queued audio messages (if any arrived while connecting)
+    for (const msg of aiQueue) {
+      ai.send(msg);
+    }
+    aiQueue.length = 0;
+  });
 
   /* ------------------------------------------------
    *  OPENAI → TWILIO  (AI SPEAKS)
    * ------------------------------------------------ */
+
   ai.on("message", (raw) => {
     let msg;
-    try { msg = JSON.parse(raw.toString()); }
-    catch { return; }
+    try {
+      msg = JSON.parse(raw.toString());
+    } catch {
+      return;
+    }
 
-    console.log("🔈 OpenAI event:", msg.type);
+    // Debug log
+    // console.log("OpenAI event:", msg.type);
 
     if (
       msg.type === "response.audio.delta" ||
@@ -155,7 +177,8 @@ wss.on("connection", (ws) => {
       // Float32 → PCM16
       const pcm16 = new Int16Array(pcm8.length);
       for (let i = 0; i < pcm8.length; i++) {
-        pcm16[i] = Math.max(-1, Math.min(1, pcm8[i])) * 32767;
+        const v = Math.max(-1, Math.min(1, pcm8[i]));
+        pcm16[i] = v * 32767;
       }
 
       // PCM16 → μ-law
@@ -164,30 +187,45 @@ wss.on("connection", (ws) => {
         mu[i] = linearToMuLawSample(pcm16[i]);
       }
 
-      // ❗ PAD to SAFE 160-byte chunk
+      // Pad small frames for safety
       if (mu.length < 160) {
         const padded = Buffer.alloc(160);
         mu.copy(padded);
         mu = padded;
       }
 
-      ws.send(JSON.stringify({
-        event: "media",
-        media: { payload: mu.toString("base64") }
-      }));
+      ws.send(
+        JSON.stringify({
+          event: "media",
+          media: { payload: mu.toString("base64") },
+        })
+      );
     }
   });
 
   /* ------------------------------------------------
    *  TWILIO → OPENAI  (CALLER SPEAKS)
    * ------------------------------------------------ */
+
   ws.on("message", (message) => {
     let data;
-    try { data = JSON.parse(message.toString()); }
-    catch { return; }
+    try {
+      data = JSON.parse(message.toString());
+    } catch {
+      return;
+    }
 
     if (data.event === "start") {
       console.log("🟢 Stream START:", data.streamSid);
+      return;
+    }
+
+    if (data.event === "stop") {
+      console.log("🔴 Stream STOP:", data.streamSid);
+      try {
+        ai.close();
+      } catch {}
+      return;
     }
 
     if (data.event === "media") {
@@ -208,35 +246,43 @@ wss.on("connection", (ws) => {
       // 8k → 24k
       const pcm24 = resampleLinear(pcmFloat, 8000, 24000);
 
-      // Float32 → PCM16
-      const out = Buffer.alloc(pcm24.length * 2);
+      // Float32 → PCM16 Buffer for OpenAI
+      const outBuf = Buffer.alloc(pcm24.length * 2);
       for (let i = 0; i < pcm24.length; i++) {
-        out.writeInt16LE(Math.max(-1, Math.min(1, pcm24[i])) * 32767, i * 2);
+        const v = Math.max(-1, Math.min(1, pcm24[i]));
+        outBuf.writeInt16LE(v * 32767, i * 2);
       }
 
-      ai.send(JSON.stringify({
+      const appendMsg = JSON.stringify({
         type: "input_audio_buffer.append",
-        audio: out.toString("base64")
-      }));
+        audio: outBuf.toString("base64"),
+      });
 
-      ai.send(JSON.stringify({ type: "input_audio_buffer.commit" }));
+      const commitMsg = JSON.stringify({
+        type: "input_audio_buffer.commit",
+      });
 
-      // ❗ Tell OpenAI to reply with audio
-      ai.send(JSON.stringify({
+      const responseMsg = JSON.stringify({
         type: "response.create",
-        response: { modalities: ["audio"] }
-      }));
-    }
+        response: { modalities: ["audio"] },
+      });
 
-    if (data.event === "stop") {
-      console.log("🔴 Stream STOP", data.streamSid);
-      ai.close();
+      // If OpenAI is ready, send immediately. Otherwise queue.
+      if (aiReady && ai.readyState === WebSocket.OPEN) {
+        ai.send(appendMsg);
+        ai.send(commitMsg);
+        ai.send(responseMsg);
+      } else {
+        aiQueue.push(appendMsg, commitMsg, responseMsg);
+      }
     }
   });
 
   ws.on("close", () => {
     console.log("❌ Twilio WebSocket CLOSED");
-    try { ai.close(); } catch {}
+    try {
+      ai.close();
+    } catch {}
   });
 });
 
@@ -248,9 +294,9 @@ app.post("/twilio/voice", (_req, res) => {
   const twiml = new twilio.twiml.VoiceResponse();
   const connect = twiml.connect();
 
+  // IMPORTANT: WSS at ROOT (no /twilio-media-stream path)
   connect.stream({
-    // Must be ROOT path — your WSS listens at "/"
-    url: "wss://restaurant-voice-agent-v2.onrender.com"
+    url: "wss://restaurant-voice-agent-v2.onrender.com",
   });
 
   res.type("text/xml");

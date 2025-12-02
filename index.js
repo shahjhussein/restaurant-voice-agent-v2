@@ -5,6 +5,9 @@ import WebSocket from "ws";
 import { WebSocketServer } from "ws";
 import http from "http";
 
+import { decodeUlaw, encodeUlaw } from "@wasm-audio-decoders/ulaw";
+import Resampler from "wav-resampler";
+
 dotenv.config();
 
 // ----------------------------------------------------
@@ -15,23 +18,25 @@ function connectToOpenAI() {
     "wss://api.openai.com/v1/realtime?model=gpt-4o-realtime-preview",
     {
       headers: {
-        "Authorization": `Bearer ${process.env.OPENAI_API_KEY}`,
-        "OpenAI-Beta": "realtime=v1"
-      }
+        Authorization: `Bearer ${process.env.OPENAI_API_KEY}`,
+        "OpenAI-Beta": "realtime=v1",
+      },
     }
   );
 
   openAiWs.on("open", () => {
     console.log("🧠 Connected to OpenAI Realtime");
 
-    openAiWs.send(JSON.stringify({
-      type: "session.update",
-      session: {
-        instructions: "You are a friendly restaurant AI assistant.",
-        modalities: ["audio"],
-        voice: "alloy"
-      }
-    }));
+    openAiWs.send(
+      JSON.stringify({
+        type: "session.update",
+        session: {
+          instructions: "You are a friendly restaurant AI assistant.",
+          modalities: ["audio"],
+          voice: "alloy",
+        },
+      })
+    );
   });
 
   openAiWs.on("close", () => {
@@ -56,7 +61,7 @@ app.get("/", (req, res) => {
 });
 
 // ----------------------------------------------------
-//  CREATE HTTP SERVER + WEBSOCKET SERVER
+//  CREATE HTTP + WEBSOCKET SERVER
 // ----------------------------------------------------
 const server = http.createServer(app);
 const wss = new WebSocketServer({ server });
@@ -71,23 +76,41 @@ wss.on("connection", (ws) => {
   const openAiWs = connectToOpenAI();
 
   // ----------------------------
-  //  HANDLE OPENAI → TWILIO AUDIO
+  //  OPENAI → TWILIO (AI SPEAKS)
   // ----------------------------
   openAiWs.on("message", (raw) => {
     const msg = JSON.parse(raw.toString());
 
     if (msg.type === "response.audio.delta") {
-      const audioChunk = msg.delta; // base64 PCM
+      // PCM from OpenAI
+      const pcmBuffer = Buffer.from(msg.delta, "base64");
 
-      ws.send(JSON.stringify({
-        event: "media",
-        media: { payload: audioChunk }
-      }));
+      // Convert PCM → Float32
+      const pcmFloat = new Float32Array(pcmBuffer.length / 2);
+      for (let i = 0; i < pcmFloat.length; i++) {
+        pcmFloat[i] = pcmBuffer.readInt16LE(i * 2) / 0x7fff;
+      }
+
+      // Resample 24k → 8k for Twilio
+      const pcm8k = Resampler.resample(pcmFloat, 24000, 8000);
+
+      // Encode mulaw
+      const mulawOut = encodeUlaw(pcm8k);
+
+      // Send audio back to Twilio
+      ws.send(
+        JSON.stringify({
+          event: "media",
+          media: {
+            payload: Buffer.from(mulawOut).toString("base64"),
+          },
+        })
+      );
     }
   });
 
   // ----------------------------
-  //  HANDLE TWILIO → OPENAI AUDIO
+  //  TWILIO → OPENAI (CALLER SPEAKS)
   // ----------------------------
   ws.on("message", (msg) => {
     const data = JSON.parse(msg.toString());
@@ -97,13 +120,28 @@ wss.on("connection", (ws) => {
     }
 
     if (data.event === "media") {
-      // Append caller audio chunk
-      openAiWs.send(JSON.stringify({
-        type: "input_audio_buffer.append",
-        audio: data.media.payload
-      }));
+      // 1. Decode Twilio mulaw → PCM float32
+      const mulawBytes = Buffer.from(data.media.payload, "base64");
+      const pcmFloat = decodeUlaw(mulawBytes);
 
-      // Tell OpenAI to process what we've received
+      // 2. Resample from 8k → 24k for OpenAI
+      const pcm24k = Resampler.resample(pcmFloat, 8000, 24000);
+
+      // 3. Convert float32 → int16
+      const pcmInt16 = Buffer.alloc(pcm24k.length * 2);
+      for (let i = 0; i < pcm24k.length; i++) {
+        const s = Math.max(-1, Math.min(1, pcm24k[i]));
+        pcmInt16.writeInt16LE(s * 0x7fff, i * 2);
+      }
+
+      // 4. Send audio to OpenAI
+      openAiWs.send(
+        JSON.stringify({
+          type: "input_audio_buffer.append",
+          audio: pcmInt16.toString("base64"),
+        })
+      );
+
       openAiWs.send(JSON.stringify({ type: "input_audio_buffer.commit" }));
       openAiWs.send(JSON.stringify({ type: "response.create" }));
     }
@@ -126,7 +164,7 @@ app.post("/twilio/voice", (req, res) => {
 
   const connect = twiml.connect();
   connect.stream({
-    url: "wss://restaurant-voice-agent-v2.onrender.com/twilio-media-stream"
+    url: "wss://restaurant-voice-agent-v2.onrender.com/twilio-media-stream",
   });
 
   res.type("text/xml");

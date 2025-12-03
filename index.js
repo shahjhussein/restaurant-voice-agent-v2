@@ -76,6 +76,7 @@ const wss = new WebSocketServer({ noServer: true });
 
 // Handle WebSocket upgrades explicitly (Render needs this)
 server.on("upgrade", (req, socket, head) => {
+  console.log("UPGRADE REQUEST PATH:", req.url);
   if (req.url === "/media") {
     wss.handleUpgrade(req, socket, head, (ws) => {
       wss.emit("connection", ws, req);
